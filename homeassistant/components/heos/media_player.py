@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Coroutine
-from functools import reduce, wraps
+from functools import partial, reduce, wraps
+from ipaddress import IPv6Address, ip_address
 import logging
 from operator import ior
 from typing import Any, ParamSpec
 
-from pyheos import HeosError, const as heos_const
+from getmac import get_mac_address
+from pyheos import HeosError, HeosPlayer, const as heos_const
 
 from homeassistant.components import media_source
 from homeassistant.components.media_player import (
@@ -23,7 +25,11 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import (
+    CONNECTION_NETWORK_MAC,
+    DeviceInfo,
+    format_mac,
+)
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
@@ -31,6 +37,7 @@ from homeassistant.helpers.dispatcher import (
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.dt import utcnow
 
+from . import GroupManager, SourceManager
 from .const import (
     DATA_ENTITY_ID_MAP,
     DATA_GROUP_MANAGER,
@@ -84,8 +91,12 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     """Add media players for a config entry."""
-    players = hass.data[HEOS_DOMAIN][DOMAIN]
-    devices = [HeosMediaPlayer(player) for player in players.values()]
+    players: dict[int, HeosPlayer] = hass.data[HEOS_DOMAIN][DOMAIN]
+    devices = [
+        HeosMediaPlayer(player, await _async_get_mac_address(hass, player.ip_address))
+        for player in players.values()
+    ]
+
     async_add_entities(devices, True)
 
 
@@ -119,20 +130,31 @@ class HeosMediaPlayer(MediaPlayerEntity):
     _attr_has_entity_name = True
     _attr_name = None
 
-    def __init__(self, player):
+    def __init__(self, player: HeosPlayer, mac_address: str | None) -> None:
         """Initialize."""
         self._media_position_updated_at = None
         self._player = player
-        self._signals = []
-        self._source_manager = None
-        self._group_manager = None
+        self._signals = list[Callable[[], None]]()
+        self._source_manager: SourceManager = self.hass.data[HEOS_DOMAIN][
+            DATA_SOURCE_MANAGER
+        ]
+        self._group_manager: GroupManager = self.hass.data[HEOS_DOMAIN][
+            DATA_GROUP_MANAGER
+        ]
         self._attr_unique_id = str(player.player_id)
-        self._attr_device_info = DeviceInfo(
+
+        connections: set[tuple[str, str]] = set()
+
+        if mac_address:
+            connections.add((CONNECTION_NETWORK_MAC, mac_address))
+
+        self._attr_device_info: DeviceInfo = DeviceInfo(
             identifiers={(HEOS_DOMAIN, player.player_id)},
             manufacturer="HEOS",
             model=player.model,
             name=player.name,
             sw_version=player.version,
+            connections=connections,
         )
 
     async def _player_update(self, player_id, event):
@@ -173,7 +195,8 @@ class HeosMediaPlayer(MediaPlayerEntity):
     @log_command_error("join_players")
     async def async_join_players(self, group_members: list[str]) -> None:
         """Join `group_members` as a player group with the current player."""
-        await self._group_manager.async_join_players(self.entity_id, group_members)
+        if self._group_manager:
+            await self._group_manager.async_join_players(self.entity_id, group_members)
 
     @log_command_error("pause")
     async def async_media_pause(self) -> None:
@@ -293,12 +316,6 @@ class HeosMediaPlayer(MediaPlayerEntity):
             ior, current_support, BASE_SUPPORTED_FEATURES
         )
 
-        if self._group_manager is None:
-            self._group_manager = self.hass.data[HEOS_DOMAIN][DATA_GROUP_MANAGER]
-
-        if self._source_manager is None:
-            self._source_manager = self.hass.data[HEOS_DOMAIN][DATA_SOURCE_MANAGER]
-
     @log_command_error("unjoin_player")
     async def async_unjoin_player(self) -> None:
         """Remove this player from any group."""
@@ -329,6 +346,8 @@ class HeosMediaPlayer(MediaPlayerEntity):
     @property
     def group_members(self) -> list[str]:
         """List of players which are grouped together."""
+        if not self._group_manager:
+            raise RuntimeError()
         return self._group_manager.group_membership.get(self.entity_id, [])
 
     @property
@@ -423,3 +442,33 @@ class HeosMediaPlayer(MediaPlayerEntity):
             media_content_id,
             content_filter=lambda item: item.media_content_type.startswith("audio/"),
         )
+
+
+async def _async_get_mac_address(hass: HomeAssistant, host: str) -> str | None:
+    """Get mac address from host name, IPv4 address, or IPv6 address."""
+    # Help mypy, which has trouble with the async_add_executor_job + partial call
+    mac_address: str | None
+    # getmac has trouble using IPv6 addresses as the "hostname" parameter so
+    # assume host is an IP address, then handle the case it's not.
+    try:
+        ip_addr = ip_address(host)
+    except ValueError:
+        mac_address = await hass.async_add_executor_job(
+            partial(get_mac_address, hostname=host)
+        )
+    else:
+        if ip_addr.version == 4:
+            mac_address = await hass.async_add_executor_job(
+                partial(get_mac_address, ip=host)
+            )
+        else:
+            # Drop scope_id from IPv6 address by converting via int
+            ip_addr = IPv6Address(int(ip_addr))
+            mac_address = await hass.async_add_executor_job(
+                partial(get_mac_address, ip6=str(ip_addr))
+            )
+
+    if not mac_address:
+        return None
+
+    return format_mac(mac_address)
