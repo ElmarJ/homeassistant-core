@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Coroutine
+from datetime import datetime
 from functools import partial, reduce, wraps
 from ipaddress import IPv6Address, ip_address
 import logging
@@ -93,7 +94,12 @@ async def async_setup_entry(
     """Add media players for a config entry."""
     players: dict[int, HeosPlayer] = hass.data[HEOS_DOMAIN][DOMAIN]
     devices = [
-        HeosMediaPlayer(player, await _async_get_mac_address(hass, player.ip_address))
+        HeosMediaPlayer(
+            player,
+            await _async_get_mac_address(hass, player.ip_address),
+            hass.data[HEOS_DOMAIN][DATA_SOURCE_MANAGER],
+            hass.data[HEOS_DOMAIN][DATA_GROUP_MANAGER],
+        )
         for player in players.values()
     ]
 
@@ -130,21 +136,24 @@ class HeosMediaPlayer(MediaPlayerEntity):
     _attr_has_entity_name = True
     _attr_name = None
 
-    def __init__(self, player: HeosPlayer, mac_address: str | None) -> None:
+    _media_position_updated_at: datetime
+    _player: HeosPlayer
+    _signals = list[Callable[[], None]]()
+
+    def __init__(
+        self,
+        player: HeosPlayer,
+        mac_address: str | None,
+        source_manager: SourceManager,
+        group_manager: GroupManager,
+    ) -> None:
         """Initialize."""
-        self._media_position_updated_at = None
         self._player = player
-        self._signals = list[Callable[[], None]]()
-        self._source_manager: SourceManager = self.hass.data[HEOS_DOMAIN][
-            DATA_SOURCE_MANAGER
-        ]
-        self._group_manager: GroupManager = self.hass.data[HEOS_DOMAIN][
-            DATA_GROUP_MANAGER
-        ]
+        self._source_manager: SourceManager = source_manager
+        self._group_manager: GroupManager = group_manager
         self._attr_unique_id = str(player.player_id)
 
-        connections: set[tuple[str, str]] = set()
-
+        connections = set[tuple[str, str]]()
         if mac_address:
             connections.add((CONNECTION_NETWORK_MAC, mac_address))
 
